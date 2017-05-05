@@ -3,7 +3,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <iostream>
-#include "linefinder.h"
 
 #include <opencv2/core/core.hpp>
 #include <opencv2/highgui/highgui.hpp>
@@ -22,12 +21,14 @@ int edgeThresh = 1;
 int threshold_ratio = 3;
 
 const char fileName[] = "./lane_detection_image.jpeg";
+//const char fileName[] = "./lane_image_1.jpg";
+//const char fileName[] = "./lane_image_2.jpg";
+//const char fileName[] = "./lane_detection_image_2.bmp";
 // Transform display window
 char display_window_name[] = "Display Window";
 
 Mat image;
-Mat result_image, gray_image, canny_image;
-Mat res;
+Mat result_image, gray_image, canny_image, roi_image;
 
 void CannyThreshold(int, void*);
 void ApplyHoughtransform(int, void*, Mat &in_image);
@@ -60,12 +61,13 @@ int main(void)
     waitKey(0);
 
     //DrawHoughLines(canny_image);
+    DrawHoughLines(roi_image);
 
-    //waitKey(0);
+    waitKey(0);
     
     //draw_lines(image);
 
-    //waitKey(0);
+    waitKey(0);
 
     return 0;
 }
@@ -117,20 +119,20 @@ void define_region_of_interest(Mat &in_image)
    
    //black.copyTo(in_image, mask);
 
-   bitwise_and(in_image, mask, res); 
+   bitwise_and(in_image, mask, roi_image); 
 
    /// Show in a window
    namedWindow( "Contours", CV_WINDOW_AUTOSIZE );
-   imshow( "Contours", res );
+   imshow( "Contours", roi_image );
 
 }
 
 void DrawHoughLines(Mat &in_image)
 {
     vector<Vec4i> lines;
-    Mat mat_image(in_image);
+    Mat mat_image(image);
     
-    HoughLinesP(in_image, lines, 1, CV_PI/180, 100, 50, 10);
+    HoughLinesP(in_image, lines, 1, CV_PI/180, 20, 20, 10);
 
     for( size_t i = 0; i < lines.size(); i++ )
     {
@@ -138,8 +140,25 @@ void DrawHoughLines(Mat &in_image)
 	    line(mat_image, Point(l[0], l[1]), Point(l[2], l[3]), Scalar(0,0,255), 3, CV_AA);
     }
 
-   namedWindow( "Hough Transform", CV_WINDOW_AUTOSIZE );
-   imshow( "Hough Transform", in_image );
+   namedWindow( "Hough", CV_WINDOW_AUTOSIZE );
+   imshow( "Hough", mat_image );
+
+#if 0
+    Mat dst;
+
+    dst = Scalar::all(0);
+
+    Mat addweight;
+    image.copyTo( dst); // copy part of src image according the canny output, canny is used as mask
+    cvtColor(res, res, CV_GRAY2BGR); // convert canny image to bgr
+    addWeighted( image, 0.5, res, 0.5, 0.0, addweight); // blend src image with canny image
+    image += res; // add src image with canny image
+
+    imshow("addition", image );
+    imshow("copyTo", dst );
+    imshow("addwweighted", addweight );
+    waitKey(0);
+#endif
 }
 
 void draw_lines(Mat &in_image, Vector<Vec4i> &line, int thickness)
