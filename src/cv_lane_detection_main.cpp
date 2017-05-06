@@ -18,22 +18,26 @@
 using namespace cv;
 using namespace std;
 
-#define NUM_THREADS                     	1
-//#define VIDEO_CAPTURE_THREAD            	1
-//#define FEATURE_EXTRACTION_THREAD       	2
-//#define LANE_DETECTION_THREAD           	3
+#define USE_VIDEO
+
+#define HRES 640        //Horizontal resolution i.e. width
+#define VRES 480        //Vertical resolution i.e. height
+
+#define NUM_ITERATIONS						1
+
+#define NUM_THREADS                     	3
+#define VIDEO_CAPTURE_THREAD            	1
+#define FEATURE_EXTRACTION_THREAD       	2
+#define LANE_DETECTION_THREAD           	3
 //#define ALERT_SERVICE_THREAD            	4
 
-#define FEATURE_EXTRACTION_THREAD       	1
-
+#define VIDEO_CAPTURE_SOFT_DEADLINE_MS          190    /* Corresponding to an average frame rate of 5.85 fps + ~20 ms margin */
 #define FEATURE_EXTRACTION_SOFT_DEADLINE_MS   	100    /* Corresponding to an average frame rate of 8.7 fps + ~20 ms margin */
-//#define VIDEO_CAPTURE_SOFT_DEADLINE_MS          190    /* Corresponding to an average frame rate of 5.85 fps + ~20 ms margin */
-//#define LANE_DETECTION_SOFT_DEADLINE_MS       	170    /* Corresponding to an average frame rate of 6.5 fps + ~20 ms margin */
+#define LANE_DETECTION_SOFT_DEADLINE_MS       	170    /* Corresponding to an average frame rate of 6.5 fps + ~20 ms margin */
 //#define ALERT_SERVICE_SOFT_DEADLINE_MS        	170    /* Corresponding to an average frame rate of 6.5 fps + ~20 ms margin */
 //#define COMBINED_SOFT_DEADLINE_MS       	500
 
-#define COMBINED_SOFT_DEADLINE_MS       	100
-
+#define COMBINED_SOFT_DEADLINE_MS       	500
 
 pthread_t threads[NUM_THREADS];
 pthread_attr_t rt_sched_attr[NUM_THREADS];
@@ -43,18 +47,22 @@ struct sched_param nrt_param;
 struct timeval tv;
 int temp=0;
 
+double video_capt_start_time = 0, video_capt_stop_time = 0;
 double feat_ext_start_time = 0, feat_ext_stop_time = 0;
+double lane_detect_start_time = 0, lane_detect_stop_time = 0;
+double video_proc_start_time = 0, video_proc_stop_time = 0;
 double temp_time=0, prev_frame_time=0;
 double ave_framedt=0.0, ave_frame_rate=0.0, fc=0.0, framedt=0.0;
 
-int lowThreshold = 30;
+int lowThreshold = 50;
 int const max_lowThreshold = 100;
 int kernel_size = 3;
 int edgeThresh = 1;
 int threshold_ratio = 3;
 
+char str[200];
+
 CvCapture* capture;
-IplImage* frame; /* C structure to store the image in the memory */
 
 const char fileName[] = "../test_images/lane_detection_image.jpeg";
 //const char fileName[] = "../test_images/lane_image_1.jpg";
@@ -63,7 +71,11 @@ const char fileName[] = "../test_images/lane_detection_image.jpeg";
 // Transform display window
 char display_window_name[] = "Display Window";
 
+#if defined(USE_VIDEO)
+IplImage *image;
+#else
 Mat image;
+#endif
 Mat result_image, gray_image, canny_image, roi_image;
 
 void CannyThreshold(int, void*);
@@ -73,9 +85,20 @@ void DrawHoughLines(Mat &in_image);
 void Create_Threads(void);
 void Destroy_Threads(void);
 void *feature_extraction_fun(void* threadID);
+double readTOD(void);
+void display_timestamp();
+void *video_capture_fun(void* threadID);
+void *feature_extraction_fun(void* threadID);
+void *lane_detection_fun(void* threadID);
+
+sem_t sem_video_capt;
+sem_t sem_feat_ext;
+sem_t sem_lane_detect;
+sem_t sem_display_timestamp;
 
 int main(void)
 {
+#if !defined(USE_VIDEO)
 	/* Using a reference image and working with that for now */
 	image = imread(fileName, CV_LOAD_IMAGE_COLOR);
 
@@ -94,6 +117,49 @@ int main(void)
 	Destroy_Threads();
 
 	printf("Feature Extraction thread took %d ms\n", (int)(feat_ext_stop_time - feat_ext_start_time));
+#else
+
+    //namedWindow( display_window_name, CV_WINDOW_AUTOSIZE );
+
+	/* Start capturing frames from camera */
+	capture = (CvCapture *)cvCreateFileCapture("../test_images/pikes_peak.mp4");
+	/* Set height property */
+	cvSetCaptureProperty(capture, CV_CAP_PROP_FRAME_WIDTH, HRES);
+	/* Set width property */
+	cvSetCaptureProperty(capture, CV_CAP_PROP_FRAME_HEIGHT, VRES);
+
+	/* Initializing bianry semaphores */
+    sem_init(&sem_video_capt, 0, 0);
+
+	sem_init(&sem_feat_ext, 0, 0);
+
+	/* Deliberately setting the initial value of this semaphore to 0, so that canny detector thread
+	   is executed first, followed by hough line thread and hough line thread releases the
+	   sem_hough_circle semaphore */
+	sem_init(&sem_lane_detect, 0, 0);
+
+	sem_init(&sem_display_timestamp, 0, 1);
+
+	Create_Threads();
+
+	video_proc_start_time = readTOD();
+	
+	sem_post(&sem_video_capt);
+	
+    video_proc_stop_time = readTOD();
+	
+ 	printf("Video Process took %d ms for %d iteration(s)\n", 
+		(int)(video_proc_stop_time - video_proc_start_time), NUM_ITERATIONS);
+
+	Destroy_Threads();
+	
+ 	/* Releases the CvCapture structure */
+    cvReleaseCapture(&capture);
+
+    /* Destroy created window */
+    //cvDestroyWindow(display_window_name);
+
+#endif
 
 }
 
@@ -136,6 +202,19 @@ void Create_Threads(void)
 	struct timeval timeNow;
 	int rc;
 
+	printf("Creating thread %d\n", VIDEO_CAPTURE_THREAD);
+	rc = pthread_create(&threads[VIDEO_CAPTURE_THREAD], NULL, video_capture_fun, (void *)VIDEO_CAPTURE_THREAD);
+
+	if (rc)
+	{
+		printf("ERROR; pthread_create() rc is %d\n", rc);
+		perror(NULL);
+		exit(-1);
+	}
+
+	gettimeofday(&timeNow, NULL);
+	printf("Video Capture thread spawned at %d sec, %d usec\n", timeNow.tv_sec, (double)timeNow.tv_usec);
+	
 	printf("Creating thread %d\n", FEATURE_EXTRACTION_THREAD);
 	rc = pthread_create(&threads[FEATURE_EXTRACTION_THREAD], NULL, feature_extraction_fun, (void *)FEATURE_EXTRACTION_THREAD);
 
@@ -147,24 +226,10 @@ void Create_Threads(void)
 	}
 
 	gettimeofday(&timeNow, NULL);
-	printf("Feature Extraction Thread spawned at %d sec, %d usec\n", timeNow.tv_sec, (double)timeNow.tv_usec);
+	printf("Feature Extraction thread spawned at %d sec, %d usec\n", timeNow.tv_sec, (double)timeNow.tv_usec);
 
-#if 0
-	printf("Creating thread %d\n", HOUGH_LINE_THREAD);
-	rc = pthread_create(&threads[HOUGH_LINE_THREAD], NULL, HoughLineFunc, (void *)HOUGH_LINE_THREAD);
-
-	if (rc)
-	{
-		printf("ERROR; pthread_create() rc is %d\n", rc);
-		perror(NULL);
-		exit(-1);
-	}
-
-	gettimeofday(&timeNow, NULL);
-	printf("Hough Line Thread spawned at %d sec, %d usec\n", timeNow.tv_sec, (double)timeNow.tv_usec);
-
-	printf("Creating thread %d\n", HOUGH_CIRCLE_THREAD);
-	rc = pthread_create(&threads[HOUGH_CIRCLE_THREAD], NULL, HoughCircleFunc, (void *)HOUGH_CIRCLE_THREAD);
+	printf("Creating thread %d\n", LANE_DETECTION_THREAD);
+	rc = pthread_create(&threads[LANE_DETECTION_THREAD], NULL, lane_detection_fun, (void *)LANE_DETECTION_THREAD);
 
 	if (rc)
 	{
@@ -174,56 +239,109 @@ void Create_Threads(void)
 	}
 
 	gettimeofday(&timeNow, NULL);
-	printf("Hough Circle Thread spawned at %d sec, %d usec\n", timeNow.tv_sec, (double)timeNow.tv_usec);
-#endif
+	printf("Lane Detection thread spawned at %d sec, %d usec\n", timeNow.tv_sec, (double)timeNow.tv_usec);
 
+}
+
+void *video_capture_fun(void* threadID)
+{
+	while(temp < NUM_ITERATIONS)
+	{
+		video_capt_start_time = readTOD();
+
+		sem_wait(&sem_video_capt);    
+
+		temp_time = readTOD();
+		display_timestamp();
+		printf("Capturing Video Frame %d\n", temp+1);
+		image = cvQueryFrame(capture);
+		temp++;
+	
+		video_capt_stop_time = readTOD();
+
+		/* Release the semaphore for feature extraction thread */
+		sem_post(&sem_feat_ext);
+
+		printf("Video Capture thread instance %d ran for %d ms\n", temp, (int)(video_capt_stop_time - video_capt_start_time));
+	}
+
+	pthread_exit(NULL);
 }
 
 void *feature_extraction_fun(void* threadID)
 {
-    feat_ext_start_time = readTOD();
-    
-    CannyThreshold(0, 0);
+	while(temp < NUM_ITERATIONS)
+	{
+		feat_ext_start_time = readTOD();
 
-    define_region_of_interest(canny_image);
- 
-    DrawHoughLines(roi_image);
+		sem_wait(&sem_feat_ext);    
 
-    feat_ext_stop_time = readTOD();
+		CannyThreshold(0, 0);
 
-    pthread_exit(NULL);
+		define_region_of_interest(canny_image);
+
+		feat_ext_stop_time = readTOD();
+
+		printf("Feature extraction thread instance %d ran for %d ms\n", temp, (int)(feat_ext_stop_time - feat_ext_start_time));
+	
+		/* Release the semaphore for lane detection thread */
+		sem_post(&sem_lane_detect);
+	}
+
+	pthread_exit(NULL);
 }
 
+void *lane_detection_fun(void* threadID)
+{
+	while(temp < NUM_ITERATIONS)
+	{
+		lane_detect_start_time = readTOD();
+
+		sem_wait(&sem_lane_detect);    
+
+		DrawHoughLines(roi_image);
+
+		lane_detect_stop_time = readTOD();
+
+		printf("Lane Detection thread instance %d ran for %d ms\n", temp, (int)(lane_detect_stop_time - lane_detect_start_time));
+	
+		/* Release the semaphore for timestamp display function and video capture thread */	
+		sem_post(&sem_video_capt);
+
+		sem_post(&sem_display_timestamp);
+	}
+
+	pthread_exit(NULL);
+}
 
 void Destroy_Threads(void)
 {
-    if(pthread_join(threads[FEATURE_EXTRACTION_THREAD], NULL) == 0)
+    if(pthread_join(threads[VIDEO_CAPTURE_THREAD], NULL) == 0)
+        printf("Video Capture Thread done\n");
+    else
+        perror("Video Capture Thread");
+    
+	if(pthread_join(threads[FEATURE_EXTRACTION_THREAD], NULL) == 0)
         printf("Feature Extraction Thread done\n");
     else
         perror("Feature Extraction Thread");
 
-#if 0
-    if(pthread_join(threads[HOUGH_LINE_THREAD], NULL) == 0)
-        printf("Hough Line Thread done\n");
+    if(pthread_join(threads[LANE_DETECTION_THREAD], NULL) == 0)
+        printf("Lane Detection Thread done\n");
     else
-        perror("Hough Line Thread");
+        perror("Lane Detection Thread");
 
-    if(pthread_join(threads[HOUGH_CIRCLE_THREAD], NULL) == 0)
-        printf("Hough Circle Thread done\n");
-    else
-        perror("Hough Circle Thread");
-
-#endif
 }
 
 void CannyThreshold(int, void*)
 {
     //Mat inv_image;
 
-    cvtColor(image, gray_image, CV_RGB2GRAY);
+	Mat canny_frame(image);
+    cvtColor(canny_frame, gray_image, CV_RGB2GRAY);
 
     /// Reduce noise with a kernel 3x3
-    blur(gray_image, canny_image, Size(3,3) );
+    blur(gray_image, canny_image, Size(3,3));
 
     /// Canny detector
     Canny(canny_image, canny_image, lowThreshold, lowThreshold*threshold_ratio, kernel_size );
@@ -233,12 +351,27 @@ void CannyThreshold(int, void*)
     /// Using Canny's output as a mask, we display our result
     result_image = Scalar::all(0);
 
-    image.copyTo(result_image, canny_image);
+    canny_frame.copyTo(result_image, canny_image);
 
     //namedWindow("Canny Display Window", WINDOW_AUTOSIZE );// Create a window for display.
     //imshow("Canny Display Window", result_image);
     
     //imshow(display_window_name, result_image);
+
+	vector<int> compression_params;
+	compression_params.push_back(CV_IMWRITE_PNG_COMPRESSION);
+	compression_params.push_back(9);
+
+	sprintf(str, "Image_%llu.png", (unsigned long long)readTOD());   
+	try 
+	{
+		printf("Writing to file : %s\n", str);
+		imwrite(str, result_image, compression_params);
+	}
+	catch (runtime_error& ex) {
+		fprintf(stderr, "Exception converting image to PNG format: %s\n", ex.what());
+	}
+
 
 }
 
@@ -274,7 +407,7 @@ void DrawHoughLines(Mat &in_image)
 {
     vector<Vec4i> lines;
     Mat mat_image(image);
-    
+	 
     HoughLinesP(in_image, lines, 1, CV_PI/180, 20, 20, 300);
 
     for( size_t i = 0; i < lines.size(); i++ )
@@ -283,9 +416,24 @@ void DrawHoughLines(Mat &in_image)
 	    line(mat_image, Point(l[0], l[1]), Point(l[2], l[3]), Scalar(0,0,255), 3, CV_AA);
     }
 
-   //namedWindow( "Hough", CV_WINDOW_AUTOSIZE );
-   //imshow( "Hough", mat_image );
-   //imwrite("feat_ext_out.jpg", mat_image);
+	//namedWindow( "Hough", CV_WINDOW_AUTOSIZE );
+	//imshow( "Hough", mat_image );
+  
+#if 0 
+	vector<int> compression_params;
+	compression_params.push_back(CV_IMWRITE_PNG_COMPRESSION);
+	compression_params.push_back(9);
+
+	sprintf(str, "Image_%llu.png", (unsigned long long)readTOD());   
+	try 
+	{
+		printf("Writing to file : %s\n", str);
+		imwrite(str, mat_image, compression_params);
+	}
+	catch (runtime_error& ex) {
+		fprintf(stderr, "Exception converting image to PNG format: %s\n", ex.what());
+	}
+#endif	
 
 }
 
